@@ -147,6 +147,36 @@ def user_name(user_id):
     return nm or None
 
 
+ALIASES = os.path.join(BASE, "aliases.json")   # {chatId: подпись владельца} — «/name …» для тех, у кого MAX скрыл номер
+_alias_lock = threading.Lock()
+
+
+def alias_get(chat_id):
+    try:
+        with open(ALIASES, encoding="utf-8") as f:
+            return (json.load(f).get(str(chat_id)) or "").strip() or None
+    except Exception:
+        return None
+
+
+def alias_set(chat_id, name):
+    with _alias_lock:
+        try:
+            with open(ALIASES, encoding="utf-8") as f:
+                m = json.load(f)
+        except Exception:
+            m = {}
+        if name:
+            m[str(chat_id)] = name
+        else:
+            m.pop(str(chat_id), None)
+        tmp = ALIASES + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(m, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, ALIASES)
+    _people_cache["ts"] = 0.0                      # список контактов перечитать
+
+
 def contact_for(chat_id, sender, display=True):
     """Имя собеседника личного чата по userId отправителя (уведомление может быть о звонке).
     display=True — как он подписан у владельца в Telegram (по номеру), если есть; иначе — из MAX.
@@ -163,7 +193,7 @@ def contact_for(chat_id, sender, display=True):
     except Exception:
         return None
     if display:
-        tg = tg_name_by_phone(info.get("phone"))
+        tg = alias_get(chat_id) or tg_name_by_phone(info.get("phone"))
         if tg:
             return tg
     nm = (info.get("name") or "").strip()
@@ -271,7 +301,65 @@ def _tg_msgid(stdout):
     return False
 
 
-def tg_send(cfg, text, reply_to=None):
+# ---------- темы в личном чате с ботом (Bot API 9.4: Threaded Mode у @BotFather) ----------
+# У каждой переписки MAX своя тема; всё от человека — в его тему; текст владельца в теме — этому человеку.
+# Текущая тема задаётся на поток работы (_tl.thread), tg_send/_tg_multipart берут её сами.
+_tl = threading.local()
+_topics_ok = [False]          # getMe.has_topics_enabled
+TOPICS = os.path.join(BASE, "topics.json")   # {"by_chat": {chatId: thread}, "by_thread": {thread: {c, n}}}
+_topics_lock = threading.Lock()
+
+
+def _topics_load():
+    try:
+        with open(TOPICS, encoding="utf-8") as f:
+            m = json.load(f)
+    except Exception:
+        m = {}
+    m.setdefault("by_chat", {})
+    m.setdefault("by_thread", {})
+    return m
+
+
+def topic_for(cfg, chat_id, name):
+    """Тема этой переписки (создаётся при первом сообщении) или None (темы выключены/не вышло)."""
+    if not _topics_ok[0] or chat_id in (None, ""):
+        return None
+    cid = str(chat_id)
+    with _topics_lock:
+        m = _topics_load()
+        if cid in m["by_chat"]:
+            return m["by_chat"][cid]
+        r = None
+        try:
+            r = tg_api(cfg, "createForumTopic", {"chat_id": cfg["chat_id"],
+                                                 "name": (name or "MAX").strip()[:128] or "MAX"})
+            th = int(r["result"]["message_thread_id"]) if r and r.get("ok") else None
+        except Exception as e:
+            log(f"темы: не создал {e!r}")
+            th = None
+        if not th:
+            log(f"темы: createForumTopic отказ {str(r)[:160]}")
+            return None
+        m["by_chat"][cid] = th
+        m["by_thread"][str(th)] = {"c": cid, "n": (name or "").strip()}
+        tmp = TOPICS + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(m, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, TOPICS)
+        log(f"темы: создана тема {th} для чата {cid}")
+        return th
+
+
+def topic_target(thread):
+    """Тема -> {c: chatId MAX, n: имя} или None."""
+    if not thread:
+        return None
+    with _topics_lock:
+        return _topics_load()["by_thread"].get(str(thread))
+
+
+def tg_send(cfg, text, reply_to=None, markup=None):
     """message_id (истина) — доставлено, False — нет. Через curl.exe и SOCKS5 на ПК владельца."""
     if not cfg["token"] or not cfg["chat_id"]:
         log("нет bot_token / chat_id в config.ini")
@@ -284,6 +372,11 @@ def tg_send(cfg, text, reply_to=None):
     if reply_to:
         cmd += ["--data-urlencode", f"reply_to_message_id={reply_to}",
                 "--data-urlencode", "allow_sending_without_reply=true"]
+    if markup:
+        cmd += ["--data-urlencode", "reply_markup=" + json.dumps(markup, ensure_ascii=False)]
+    th = getattr(_tl, "thread", None)
+    if th:
+        cmd += ["--data-urlencode", f"message_thread_id={th}"]
     try:
         r = subprocess.run(cmd, capture_output=True, timeout=40, creationflags=NO_WINDOW)
         mid = _tg_msgid(r.stdout)
@@ -698,13 +791,17 @@ def _http_get(url, cap=PHOTO_MAX, ctx=None):
 
 def _tg_multipart(cfg, method, field, filename, ctype, data, caption):
     """Отправка файла в Telegram (sendPhoto/sendDocument) через curl + SOCKS-прокси."""
-    tmp = os.path.join(tempfile.gettempdir(), f"mx_{int(time.time()*1000)}_{os.getpid()}")
+    tmp = os.path.join(tempfile.gettempdir(),
+                       f"mx_{int(time.time()*1000)}_{os.getpid()}_{threading.get_ident()}")
     with open(tmp, "wb") as f:
         f.write(data)
     try:
         api = f"https://api.telegram.org/bot{cfg['token']}/{method}"
         cmd = ["curl.exe", "-s", "--max-time", "90", "-x", cfg["proxy"], api,
                "-F", f"chat_id={cfg['chat_id']}"]
+        th = getattr(_tl, "thread", None)
+        if th:
+            cmd += ["-F", f"message_thread_id={th}"]
         if caption:
             cmd += ["-F", f"caption={caption}"]
         cmd += ["-F", f"{field}=@{tmp};type={ctype};filename={filename}"]
@@ -790,7 +887,9 @@ def send_voice(cfg, url, caption, who=None, chat=None):
         log("голосовое: sendVoice отклонён, шлю файлом")
         mid = _tg_multipart(cfg, "sendDocument", "document", "voice.ogg", "audio/ogg", data, caption)
     if mid and cfg.get("transcribe", True):
+        th = getattr(_tl, "thread", None)             # расшифровка — в ту же тему, что и голосовое
         def work():
+            _tl.thread = th
             text, why = transcribe(cfg, data)
             if text:
                 body = _cap("📝 " + text)
@@ -805,12 +904,16 @@ def send_voice(cfg, url, caption, who=None, chat=None):
 
 
 def send_action(cfg, act):
-    """Единая отправка пунктов очереди CDP: текст или фото."""
-    if act.get("kind") == "photo":
-        return send_photo(cfg, act["url"], act.get("caption", ""), act.get("name", ""))
-    if act.get("kind") == "voice":
-        return send_voice(cfg, act["url"], act.get("caption", ""), act.get("who"), act.get("chat"))
-    return tg_send(cfg, act["text"], act.get("reply_to"))
+    """Единая отправка пунктов очереди CDP: текст / фото / голосовое — в тему этой переписки."""
+    _tl.thread = topic_for(cfg, act.get("chat"), act.get("who"))
+    try:
+        if act.get("kind") == "photo":
+            return send_photo(cfg, act["url"], act.get("caption", ""), act.get("name", ""))
+        if act.get("kind") == "voice":
+            return send_voice(cfg, act["url"], act.get("caption", ""), act.get("who"), act.get("chat"))
+        return tg_send(cfg, act["text"], act.get("reply_to"))
+    finally:
+        _tl.thread = None
 
 
 # ---------- видео и файлы: берём через саму страницу MAX (CDP) ----------
@@ -927,6 +1030,7 @@ def media_worker(kind, name, chat_id, sender_id=None):
         if not c or not cfg:
             log(f"медиа: нет CDP/cfg — {kind} '{name}' пропущен")
             return
+        _tl.thread = topic_for(cfg, chat_id, display or sender)   # видео/файл — в тему этой переписки
         _media_busy[0] = True
         try:
             set_edge_windows(SW_SHOWNOACTIVATE)  # показать окно без фокуса — чтобы лента рендерилась
@@ -1037,7 +1141,10 @@ _rmap_lock = threading.Lock()
 _rmap = [None]
 _echo = []               # (ts, chatId, текст) — свои отправленные, чтобы не переслать обратно
 _echo_lock = threading.Lock()
-HELP = ("Ответ в MAX: нажми «Ответить» на пересланном сообщении и напиши текст — он уйдёт "
+HELP = ("Переписки — по темам (вкладки наверху): что написал в теме человека, уходит ему.\n"
+        "Новому собеседнику: «📇 Контакты» внизу → выбери человека → откроется его тема → пиши там. "
+        "Или «✍️ Написать» → имя → выбери человека.\n"
+        "Ответ в MAX: нажми «Ответить» на пересланном сообщении и напиши текст — он уйдёт "
         "этому человеку в личный чат MAX.\nИли первой строкой «@Имя» (как в шапке 💬), "
         "со второй — текст.\nТекст, фото, видео и файлы до 20 МБ (подпись к файлу уйдёт следом текстом); только личные чаты, в группы не отправляется.")
 
@@ -1186,13 +1293,15 @@ _JS_ROW_MATCH = r"""(() => {
   const nm = %s, k = %d;
   const norm = s => (s||'').replace(/\s+/g,' ').trim().toLowerCase();
   const n = norm(nm);
+  // самый глубокий элемент, чей текст целиком = имени (в поиске MAX имя разбито подсветкой <mark>
+  // на части — поэтому не «лист», а элемент, ни один ребёнок которого сам не совпадает)
+  const ok = e => { const t = norm(e.innerText);
+    return t && (t===n || (t.endsWith('…') && t.length>4 && n.startsWith(t.slice(0,-1).trim()))); };
   const els = [].slice.call(document.querySelectorAll('*')).filter(e => {
-    if (e.children.length) return false;
     const r = e.getBoundingClientRect();
     if (!(r.left<340 && r.top>90 && r.width>25 && r.height>0 && r.height<40)) return false;
-    const t = norm(e.innerText);
-    if (!t) return false;
-    return t===n || (t.endsWith('…') && t.length>4 && n.startsWith(t.slice(0,-1).trim()));
+    if (!ok(e)) return false;
+    return ![].slice.call(e.children).some(ok);
   });
   if (k < 0) return els.length;
   if (k >= els.length) return 'NONE';
@@ -1259,6 +1368,291 @@ def _cur_path(c):
     return str(_cdp_eval(c, "location.pathname") or "")
 
 
+def _fold(s):
+    return re.sub(r"[^\w]+", " ", (s or "").lower().replace("ё", "е")).strip()
+
+
+# Уменьшительные -> корень полного имени: «Настя» находит «Анастасия», «Оля» — «Ольга» и т.д.
+NICK = {
+    "настя": "анастаси", "катя": "екатерин", "катюша": "екатерин", "даша": "дарь", "оля": "ольг",
+    "саша": "александр", "маша": "мари", "лена": "елен", "таня": "татьян", "наташа": "натал",
+    "юля": "юли", "женя": "евгени", "дима": "дмитри", "миша": "михаил", "сережа": "серге",
+    "коля": "никола", "костя": "константин", "леша": "алексе", "алеша": "алексе", "ваня": "иван",
+    "вова": "владимир", "володя": "владимир", "паша": "павел", "света": "светлан", "ира": "ирин",
+    "аня": "анн", "люба": "любов", "галя": "галин", "валя": "валентин", "вера": "вер",
+    "надя": "надежд", "люда": "людмил", "лиза": "елизавет", "соня": "софи", "поля": "полин",
+    "ксюша": "ксени", "вика": "виктори", "витя": "виктор", "толя": "анатоли", "гена": "геннади",
+    "петя": "петр", "гриша": "григори", "рома": "роман", "слава": "вячеслав", "стас": "станислав",
+    "андрюша": "андре", "никитка": "никит", "тема": "артем", "егорка": "егор",
+    "вася": "васили", "федя": "федор", "боря": "борис", "юра": "юри", "макс": "максим",
+    "гоша": "георги", "жора": "георги", "митя": "дмитри", "леня": "леонид", "сеня": "семен",
+    "тима": "тимофе", "даня": "данил", "влад": "владислав", "лера": "валери", "кира": "кир",
+    "кирюша": "кирилл", "игорек": "игор", "олег": "олег", "лиля": "лили", "алена": "елен",
+    "зина": "зинаид", "тамара": "тамар", "нина": "нин", "марина": "марин", "кристи": "кристин",
+    "маргарита": "маргарит", "рита": "маргарит", "эля": "эльвир", "оксана": "оксан",
+}
+
+
+def _tok_ok(tok, hay):
+    if tok in hay:
+        return True
+    root = NICK.get(tok)
+    return bool(root) and root in hay
+
+
+def find_people(query):
+    """Люди, с которыми УЖЕ есть личная переписка в MAX, по словам запроса — ищем и в имени из MAX,
+    и в подписи из Telegram владельца. -> [{chat, max, tg, exact}] или None (нет связи с MAX)."""
+    c = _cdp[0]
+    if not c:
+        return None
+    try:
+        lst = json.loads(_cdp_eval(c, "(async()=>JSON.stringify(window.__maxfwd_allContacts?"
+                                      "await window.__maxfwd_allContacts():[]))()", timeout=30) or "[]")
+    except Exception:
+        return None
+    toks = _fold(query).split()
+    res = []
+    for x in lst:
+        if not x.get("dialog") or not x.get("chat") or x.get("svc"):
+            continue                              # без переписки / служебные аккаунты MAX
+        tg = alias_get(x["chat"]) or tg_name_by_phone(x.get("phone")) or ""   # подпись владельца
+        hay = _fold((x.get("name") or "") + " " + tg)
+        if not toks or all(_tok_ok(t, hay) for t in toks):     # пустой запрос = все
+            exact = bool(toks) and _fold(query) in (_fold(tg), _fold(x.get("name")))
+            res.append({"chat": str(x["chat"]), "max": x.get("name") or "", "tg": tg, "exact": exact,
+                        "t": x.get("t") or 0, "lm": x.get("lm") or "",
+                        "named": bool(tg or x.get("custom"))})   # подписан владельцем (Telegram / телефон / /name)
+    res.sort(key=lambda r: (not r["exact"], -(r["t"] or 0)))      # точные, затем свежие переписки
+    return res
+
+
+# Кнопка «✍️ Написать» (постоянная клавиатура бота) → «Кого ищем?» → кнопки с людьми →
+# нажал на человека → «Пиши для …» с уже включённым ответом → ответ уходит обычным путём (все сверки).
+WRITE_BTN = "✍️ Написать"
+CONTACTS_BTN = "📇 Контакты"
+MAIN_KB = {"keyboard": [[{"text": CONTACTS_BTN}, {"text": WRITE_BTN}]],
+           "resize_keyboard": True, "is_persistent": True}
+_search_prompts = set()      # message_id вопросов «Кого ищем?» — ответ на них = строка поиска
+_cards = {}                  # chatId -> подпись (для кнопок с людьми)
+_pinfo = {}                  # chatId -> запись о человеке (подпись, имя в MAX, последнее сообщение, время)
+PAGE = 16                    # контактов на странице (2 столбца × 8 строк)
+
+
+_inline_ok = [None]          # включён ли у бота встроенный режим (getMe.supports_inline_queries)
+_inline_ok_ts = [0.0]
+
+
+def _short(s, n=24):
+    s = " ".join((s or "").split())
+    return s if len(s) <= n else s[:n - 1].rstrip() + "…"
+
+
+def _people_rows(people):
+    """Кнопки с людьми в 2 столбца, короткие имена."""
+    rows, row = [], []
+    for p in people:
+        disp = p["tg"] or p["max"]
+        _cards[p["chat"]] = disp
+        _pinfo[p["chat"]] = p
+        label = _short(disp)
+        if not p.get("named") and p.get("t"):     # без подписи (MAX скрыл номер) — с датой, чтобы различать
+            label = _short(disp, 16) + " · " + dt.datetime.fromtimestamp(p["t"] / 1000).strftime("%d.%m")
+        row.append({"text": label, "callback_data": f"w:{p['chat']}"})
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    return rows
+
+
+def ask_who(cfg, reply_to=None):
+    mid = tg_send(cfg, "Кого ищем? Напиши имя или его часть.", reply_to=reply_to,
+                  markup={"force_reply": True, "input_field_placeholder": "Имя или часть имени"})
+    if mid:
+        _search_prompts.add(mid)
+
+
+def contacts_markup(page):
+    """Страница списка контактов: свежие переписки сверху, листание ◀ ▶."""
+    people = all_people() or []
+    pages = max(1, (len(people) + PAGE - 1) // PAGE)
+    page = max(0, min(page, pages - 1))
+    rows = _people_rows(people[page * PAGE:(page + 1) * PAGE])
+    nav = []
+    if page > 0:
+        nav.append({"text": "◀", "callback_data": f"p:{page - 1}"})
+    if pages > 1:
+        nav.append({"text": f"{page + 1}/{pages}", "callback_data": "noop"})
+    if page < pages - 1:
+        nav.append({"text": "▶", "callback_data": f"p:{page + 1}"})
+    if nav:
+        rows.append(nav)
+    return {"inline_keyboard": rows}, len(people)
+
+
+_search_until = [0.0]         # после «Контакты» обычный текст (без «Ответить») = строка поиска
+
+
+def show_contacts(cfg, reply_to=None):
+    markup, n = contacts_markup(0)
+    if not n:
+        tg_send(cfg, "❌ Список пуст — нет связи со страницей MAX?", reply_to=reply_to)
+        return
+    tg_send(cfg, "📇 Кому пишем?", reply_to=reply_to, markup=markup)
+
+
+_people_cache = {"ts": 0.0, "list": []}
+
+
+def all_people():
+    """Все люди с личной перепиской в MAX (кэш 2 мин — встроенный поиск дёргается на каждую букву)."""
+    if time.time() - _people_cache["ts"] < 120 and _people_cache["list"]:
+        return _people_cache["list"]
+    lst = find_people("")
+    if lst is not None:
+        _people_cache["list"], _people_cache["ts"] = lst, time.time()
+    return _people_cache["list"] if lst is None else lst
+
+
+def on_inline(cfg, iq):
+    """Встроенный режим: список контактов, фильтр по набранному. Только для владельца."""
+    owner = str(cfg["chat_id"])
+    results = []
+    # только владельцу и только в чате С САМИМ БОТОМ (chat_type "sender"): иначе выбор человека
+    # отправил бы строку с его именем в чужой чат
+    if str((iq.get("from") or {}).get("id")) == owner and iq.get("chat_type") == "sender":
+        toks = _fold(iq.get("query") or "").split()
+        for p in all_people():
+            hay = _fold(p["max"] + " " + p["tg"])
+            if toks and not all(_tok_ok(t, hay) for t in toks):
+                continue
+            disp = p["tg"] or p["max"]
+            esc = disp.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            item = {"type": "article", "id": p["chat"], "title": disp,
+                    "input_message_content": {
+                        # номер чата спрятан в невидимой ссылке — по нему бот поймёт, кого выбрали
+                        "message_text": f'✍️ {esc}<a href="https://web.max.ru/{p["chat"]}">​</a>',
+                        "parse_mode": "HTML"}}
+            results.append(item)                  # одна строка на человека — компактно
+            if len(results) >= 50:
+                break
+    try:
+        tg_api(cfg, "answerInlineQuery", {"inline_query_id": iq.get("id", ""), "cache_time": 0,
+                                          "is_personal": "true",
+                                          "results": json.dumps(results, ensure_ascii=False)})
+    except Exception as e:
+        log(f"встроенный поиск: ошибка ответа {e!r}")
+
+
+def picked_from_inline(m):
+    """Сообщение «✍️ Имя», отправленное выбором из встроенного списка -> (chatId, имя) или None."""
+    if not m.get("via_bot"):
+        return None
+    for e in m.get("entities") or []:
+        mm = re.match(r"https://web\.max\.ru/(\d+)$", str(e.get("url") or ""))
+        if e.get("type") == "text_link" and mm:
+            return mm.group(1), (m.get("text") or "").replace("✍️", "").replace("​", "").strip()
+    return None
+
+
+def show_people(cfg, query, people, reply_to):
+    """Найденные люди — кнопками; нажатие = выбрать, кому писать."""
+    if people is None:
+        tg_send(cfg, "❌ Нет связи со страницей MAX — поиск не выполнен.", reply_to=reply_to)
+        return
+    if not people:
+        tg_send(cfg, f"Никого не нашёл по «{query}» среди переписок в MAX "
+                     "(ищу по именам в MAX и по твоим подписям в Telegram).", reply_to=reply_to)
+        return
+    shown = people[:PAGE]
+    head = "Кому пишем?" + (f" ({len(shown)} из {len(people)} — уточни имя)" if len(people) > len(shown) else "")
+    tg_send(cfg, head, reply_to=reply_to, markup={"inline_keyboard": _people_rows(shown)})
+    log(f"поиск: {len(query)} симв. -> {len(people)} чел.")
+
+
+def on_callback(cfg, cq):
+    """Нажата кнопка с человеком: приглашение «Пиши для …» (ответ на него уйдёт этому человеку)."""
+    owner = str(cfg["chat_id"])
+    if str((cq.get("from") or {}).get("id")) != owner:
+        return
+    data = str(cq.get("data") or "")
+    cmsg = cq.get("message") or {}
+    _tl.thread = cmsg.get("message_thread_id") if cmsg.get("is_topic_message") else None
+    if cq.get("id") and not (data.startswith("w:") and _topics_ok[0]):   # при темах ответ — ниже, с подсказкой
+        try:
+            tg_api(cfg, "answerCallbackQuery", {"callback_query_id": cq.get("id", "")})
+        except Exception:
+            pass
+    if data.startswith("p:"):                     # листание списка контактов — правим то же сообщение
+        msg = cq.get("message") or {}
+        markup, _n = contacts_markup(int(data[2:] or 0))
+        try:
+            tg_api(cfg, "editMessageReplyMarkup", {"chat_id": (msg.get("chat") or {}).get("id", ""),
+                                                   "message_id": msg.get("message_id", ""),
+                                                   "reply_markup": json.dumps(markup, ensure_ascii=False)})
+        except Exception:
+            pass
+        return
+    if not data.startswith("w:"):
+        return
+    chat = data[2:]
+    disp = _cards.get(chat) or name_by_chat(chat) or "собеседник"
+    hint = ""
+    p = _pinfo.get(chat) or {}
+    if p and not p.get("named"):                  # MAX скрыл номер — помочь опознать и подписать
+        when = dt.datetime.fromtimestamp(p["t"] / 1000).strftime("%d.%m.%Y") if p.get("t") else ""
+        if p.get("lm"):
+            hint += f"\nПоследнее в переписке ({when}): «{p['lm']}»"
+        hint += "\nКто это? Подпиши: «/name Имя»."
+    th = topic_for(cfg, chat, disp)
+    if th:                                        # темы включены — карточка в теме человека, писать прямо там
+        _tl.thread = th
+        mid = tg_send(cfg, f"💬 {disp}{hint}\nПиши здесь, в этой теме — текст или файл.")
+        _tl.thread = None
+        try:
+            tg_api(cfg, "answerCallbackQuery", {"callback_query_id": cq.get("id", ""),
+                                                "text": f"Тема «{disp[:40]}» — пиши там"})
+        except Exception:
+            pass
+    else:
+        mid = tg_send(cfg, f"💬 {disp}{hint}\nНапиши ответом на это сообщение — текст или файл.",
+                      markup={"force_reply": True, "input_field_placeholder": f"Сообщение для {disp}"[:64]})
+    remember(mid, disp, chat)
+
+
+_JS_SEARCH_SET = r"""((q)=>{const i=document.querySelector('input[placeholder="Найти"]'); if(!i) return 'noinput';
+  i.focus(); const set=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set;
+  set.call(i,q); i.dispatchEvent(new Event('input',{bubbles:true})); return 'ok';})(%s)"""
+
+
+def _max_search_open(c, chat_id, names):
+    """Чата нет в видимой части списка — ищем через строку «Найти» MAX; открытие сверяется по URL."""
+    want = "/" + str(chat_id)
+    try:
+        for nm in names:
+            if not _flat(nm):
+                continue
+            if _cdp_eval(c, _JS_SEARCH_SET % json.dumps(nm)) != "ok":
+                return False
+            time.sleep(2.5)
+            cnt = _cdp_eval(c, _JS_ROW_MATCH % (json.dumps(nm), -1)) or 0
+            for k in range(int(cnt) if isinstance(cnt, (int, float)) else 0):
+                if _cdp_eval(c, _JS_ROW_MATCH % (json.dumps(nm), k)) != "ok":
+                    continue
+                time.sleep(2.0)
+                if _cur_path(c) == want:
+                    return True
+                _cdp_eval(c, _JS_SEARCH_SET % json.dumps(nm)); time.sleep(2.0)   # вернуть результаты
+        return False
+    finally:
+        try:
+            _cdp_eval(c, _JS_SEARCH_SET % json.dumps(""))                      # очистить строку поиска
+        except Exception:
+            pass
+
+
 def max_open_chat(c, chat_id, names):
     """Открыть чат chat_id: перебор строк списка с подходящим именем, пока адрес не станет
     /<chatId>. Чужие чаты при переборе только открываются, в них ничего не пишется."""
@@ -1280,7 +1674,11 @@ def max_open_chat(c, chat_id, names):
             if _cdp_eval(c, _JS_LIST_SCROLL % json.dumps("down")) != "ok":
                 break
             time.sleep(0.7)
-    return False
+    # в списке не нашли (чат давний, глубоко) — через поиск MAX
+    ok = _max_search_open(c, chat_id, names)
+    if ok:
+        _cdp_eval(c, _JS_LIST_SCROLL % json.dumps("top"))
+    return ok
 
 
 def _check_dialog_and_open(c, chat_id, names):
@@ -1530,12 +1928,30 @@ def tg_download(cfg, f, tag):
     return dest
 
 
-def reply_worker(cfg, owner_mid, chat_id, names, body, tgfile=None):
+def tg_react(cfg, mid, emoji):
+    """Реакция бота на сообщение владельца (emoji=None — снять). True — встала."""
+    try:
+        r = tg_api(cfg, "setMessageReaction", {
+            "chat_id": cfg["chat_id"], "message_id": mid,
+            "reaction": json.dumps([{"type": "emoji", "emoji": emoji}] if emoji else [], ensure_ascii=False)})
+        ok = bool(r and r.get("ok"))
+        if not ok:
+            log(f"реакция {emoji!r}: не встала {str(r)[:120]}")
+        return ok
+    except Exception as e:
+        log(f"реакция: ошибка {e!r}")
+        return False
+
+
+def reply_worker(cfg, owner_mid, chat_id, names, body, tgfile=None, th=None):
+    _tl.thread = th                    # подтверждения — в ту же тему, где писал владелец
+    tg_react(cfg, owner_mid, "✍")      # «отправляется…» — пометка на сообщении владельца
     path = None
     if tgfile:
         path = tg_download(cfg, tgfile, owner_mid)
         if path.startswith("!"):
             log(f"ответы: файл не скачан: {path[1:]}")
+            tg_react(cfg, owner_mid, None)
             tg_send(cfg, f"❌ Не отправлено: {path[1:]}", reply_to=owner_mid)
             return
     for _ in range(90):            # сразу после старта CDP ещё не подключён — ждём, не отказываем
@@ -1578,15 +1994,30 @@ def reply_worker(cfg, owner_mid, chat_id, names, body, tgfile=None):
             with _echo_lock:
                 _sent_log.append((time.time(), str(chat_id), _flat(body), owner_mid))
                 del _sent_log[:-300]
-        mid = tg_send(cfg, f"✅ Отправлено в MAX → {info}{what}", reply_to=owner_mid)
-        remember(mid, info or (names[0] if names else ""), chat_id)
+        # успех — пометка на самом сообщении владельца (✍ → 👌); если реакция не встала — прежнее сообщение
+        remember(owner_mid, info or (names[0] if names else ""), chat_id)
+        if not tg_react(cfg, owner_mid, "👌"):
+            mid = tg_send(cfg, f"✅ Отправлено в MAX → {info}{what}", reply_to=owner_mid)
+            remember(mid, info or (names[0] if names else ""), chat_id)
     elif sent_file:
+        tg_react(cfg, owner_mid, None)
         tg_send(cfg, f"⚠️ {info}", reply_to=owner_mid)
     else:
+        tg_react(cfg, owner_mid, None)
         tg_send(cfg, f"❌ Не отправлено{what}: {info}", reply_to=owner_mid)
 
 
 def handle_update(cfg, u):
+    if u.get("callback_query"):
+        on_callback(cfg, u["callback_query"])
+        return
+    if u.get("inline_query"):                     # встроенный поиск убран (не понравился владельцу) — пустой ответ
+        try:
+            tg_api(cfg, "answerInlineQuery", {"inline_query_id": u["inline_query"].get("id", ""),
+                                              "results": "[]", "cache_time": 0})
+        except Exception:
+            pass
+        return
     m = u.get("message")
     if not m:
         return
@@ -1594,6 +2025,9 @@ def handle_update(cfg, u):
     if str((m.get("chat") or {}).get("id")) != owner or str((m.get("from") or {}).get("id")) != owner:
         log("ответы: сообщение боту не от владельца — игнор")
         return
+    # тема, в которой написал владелец: ответы бота — туда же; тема человека = адресат
+    th = m.get("message_thread_id") if m.get("is_topic_message") else None
+    _tl.thread = th
     mid = m.get("message_id")
     if time.time() - int(m.get("date") or 0) > REPLY_MAX_AGE:
         tg_send(cfg, "❌ Не отправлено: команда устарела (пришла, пока пересыльщик был выключен).",
@@ -1607,11 +2041,55 @@ def handle_update(cfg, u):
     if text is None:
         tg_send(cfg, "❌ Не отправлено: такой тип сообщения в MAX не отправляю.", reply_to=mid)
         return
-    if not tgfile and text.strip().startswith("/"):
-        tg_send(cfg, HELP)
-        return
+    low = text.strip().lower()
     rt = m.get("reply_to_message")
-    if rt:
+    if not tgfile and re.fullmatch(r"@\w*bot\s*", text.strip(), re.I):
+        return                                   # набрал «@имя_бота» и отправил — это не «@Имя» человека
+    picked = picked_from_inline(m) if not tgfile else None
+    if picked:                                   # выбрали человека во встроенном списке контактов
+        chat, disp = picked
+        _cards[chat] = disp
+        on_callback(cfg, {"from": m.get("from"), "data": f"w:{chat}"})
+        return
+    if not tgfile:
+        # кнопка «✍️ Написать» / команды поиска
+        if low in (CONTACTS_BTN.lower(), "/contacts", "/start"):
+            show_contacts(cfg)
+            return
+        if low in (WRITE_BTN.lower(), "/write", "/find"):
+            ask_who(cfg, reply_to=mid)
+            return
+        if low.startswith("/find ") or low.startswith("/write "):
+            q = text.strip().split(None, 1)[1].strip()
+            show_people(cfg, q, find_people(q), mid)
+            return
+        # ответ на «Кого ищем?» = строка поиска
+        if rt and rt.get("message_id") in _search_prompts:
+            show_people(cfg, text.strip(), find_people(text.strip()), mid)
+            return
+        # после «📇 Контакты» — обычный текст без «Ответить» = поиск (ничего не отправляет)
+        if not rt and not low.startswith(("@", "/")) and time.time() < _search_until[0] \
+                and len(text.strip()) <= 40:
+            show_people(cfg, text.strip(), find_people(text.strip()), mid)
+            return
+        # «/name Имя» ответом на карточку/пересланное — своя подпись для этого чата (MAX скрыл номер)
+        if low.startswith("/name"):
+            ent = (recall(rt.get("message_id")) if rt else None) or topic_target(th)
+            newname = text.strip()[5:].strip()
+            if not ent:
+                tg_send(cfg, "Напиши «/name Имя» в теме человека или ответом на его сообщение.", reply_to=mid)
+                return
+            alias_set(ent["c"], newname)
+            remember(mid, newname or ent.get("n"), ent["c"])
+            tg_send(cfg, f"✅ Подписал: {newname}" if newname else "✅ Подпись убрана.", reply_to=mid)
+            return
+        if low.startswith("/"):
+            tg_send(cfg, HELP, markup=MAIN_KB)
+            return
+    tt = topic_target(th)
+    if tt:                                       # написал в теме человека — адресат из темы, «Ответить» не нужен
+        chat_id, body, names = tt["c"], text, [tt.get("n") or ""]
+    elif rt:
         ent = recall(rt.get("message_id"))
         lines = [l.strip() for l in ((rt.get("text") or rt.get("caption") or "").split("\n"))]
         hdr = lines[0][1:].strip() if lines and lines[0].startswith("💬") else ""
@@ -1651,7 +2129,11 @@ def handle_update(cfg, u):
             return
         chat_id, names = ids[0], [name]
     else:
-        tg_send(cfg, "Не отправлено.\n" + HELP, reply_to=mid)
+        if _topics_ok[0]:
+            tg_send(cfg, "Не отправлено — это вне темы, бот не знает кому. Открой вкладку человека наверху "
+                         "(или выбери его в «📇 Контакты») и напиши там.", reply_to=mid)
+        else:
+            tg_send(cfg, "Не отправлено.\n" + HELP, reply_to=mid)
         return
     body = body.strip("\n")
     if not body.strip() and not tgfile:
@@ -1663,7 +2145,7 @@ def handle_update(cfg, u):
     names = [n for i, n in enumerate(names) if n and n != "MAX" and n not in names[:i]]
     log(f"ответы: принят ответ для chat={chat_id} (текст {len(body)}"
         f"{', файл' if tgfile else ''})")
-    threading.Thread(target=reply_worker, args=(cfg, mid, chat_id, names, body, tgfile),
+    threading.Thread(target=reply_worker, args=(cfg, mid, chat_id, names, body, tgfile, th),
                      daemon=True).start()
 
 
@@ -1684,11 +2166,29 @@ def reply_loop():
             pass
 
     last_err = 0
+    menu_set = False
     while True:
         cfg = _cfg[0]
         if not cfg or not cfg.get("replies"):
             time.sleep(10)
             continue
+        if time.time() - _inline_ok_ts[0] > 600:  # включён ли встроенный режим (владелец включает у @BotFather)
+            try:
+                r = tg_api(cfg, "getMe", {})
+                _inline_ok[0] = bool(r and r.get("ok") and r["result"].get("supports_inline_queries"))
+                _topics_ok[0] = bool(r and r.get("ok") and r["result"].get("has_topics_enabled"))
+                _inline_ok_ts[0] = time.time()
+            except Exception:
+                pass
+        if not menu_set:                          # меню команд бота (кнопка «Меню» в Telegram)
+            try:
+                r = tg_api(cfg, "setMyCommands", {"commands": json.dumps([
+                    {"command": "contacts", "description": "Контакты — выбрать, кому написать"},
+                    {"command": "write", "description": "Написать — найти по имени"},
+                    {"command": "help", "description": "Как отвечать в MAX"}], ensure_ascii=False)})
+                menu_set = bool(r and r.get("ok"))
+            except Exception:
+                pass
         try:
             if off is None:
                 # первый запуск: всё, что писали боту раньше, НЕ выполняем
@@ -1702,7 +2202,7 @@ def reply_loop():
                     raise RuntimeError(f"getUpdates: {str(r)[:120]}")
                 continue
             r = tg_api(cfg, "getUpdates", {"offset": off, "timeout": 25,
-                                           "allowed_updates": '["message"]'}, max_time=40)
+                                           "allowed_updates": '["message","callback_query","inline_query"]'}, max_time=40)
             if not r or not r.get("ok"):
                 raise RuntimeError(f"getUpdates: {str(r)[:160]}")
             for u in r.get("result") or []:
@@ -1863,7 +2363,7 @@ def main():
         try:
             cfg = load_cfg()
             _cfg[0] = cfg            # снимок для медиа-воркеров
-            if not started_msg and tg_send(cfg, "🔄 Пересыльщик MAX запущен."):
+            if not started_msg and tg_send(cfg, "🔄 Пересыльщик MAX запущен.", markup=MAIN_KB if cfg.get("replies") else None):
                 started_msg = True
             if time.time() - last_edge > 60:
                 ensure_edge(cfg, st)

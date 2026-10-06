@@ -199,6 +199,37 @@
     } catch (_) { return _contacts[id] || ""; }
   };
 
+  // Все контакты из базы MAX (для поиска «кому написать»): [{id, name, phone, chat, dialog}]
+  // chat = myId ^ userId (номер личного чата), dialog — есть ли уже переписка (тип DIALOG).
+  window.__maxfwd_allContacts = async function () {
+    const dbs = await indexedDB.databases();
+    const d = dbs.find(x => /^max-db-/.test(x.name || ""));
+    if (!d) return [];
+    const db = await new Promise((ok, err) => { const r = indexedDB.open(d.name); r.onsuccess = () => ok(r.result); r.onerror = () => err(r.error); });
+    const all = await new Promise(ok => {
+      const res = []; const cur = db.transaction("contacts", "readonly").objectStore("contacts").openCursor();
+      cur.onsuccess = e => { const cc = e.target.result; if (!cc) { ok(res); return; }
+        const m = cc.value.model || cc.value;
+        // служебные аккаунты MAX (Госуслуги, «Безопасность», коды…) помечены BOT/OFFICIAL/SERVICE_ACCOUNT
+        const svc = (m.options || []).some(o => /^(BOT|OFFICIAL|SERVICE_ACCOUNT)$/.test(o));
+        // custom — человек подписан владельцем (MAX взял имя из контактов его телефона)
+        const custom = (m.names || []).some(n => n && n.type === "CUSTOM");
+        res.push({ id: String(m.id), name: contactName(m.names), phone: m.phone == null ? "" : String(m.phone),
+                   svc: svc, custom: custom });
+        cc.continue(); };
+      cur.onerror = () => ok(res); });
+    db.close();
+    const me = window.__maxfwd_me, chats = window.__maxfwd_chats || {};
+    for (const x of all) {
+      let cid = "";
+      try { cid = me ? String(BigInt(me) ^ BigInt(x.id)) : ""; } catch (_) {}
+      x.chat = cid; x.dialog = !!(cid && chats[cid] && chats[cid].type === "DIALOG");
+      x.t = (cid && chats[cid] && chats[cid].t) || 0;
+      x.lm = (cid && chats[cid] && chats[cid].lm) || "";
+    }
+    return all;
+  };
+
   // Кэш сообщений (id -> отправитель, текст, чат): чтобы по реакции понять, на ЧЬЁ сообщение она.
   const _msgs = new Map();
   function noteMsg(m, chatId) {
@@ -230,12 +261,16 @@
     try { if (c.participants && typeof c.participants === "object") { ids = Object.keys(c.participants); n = ids.length; } } catch (_) {}
     const key = String(c.id), typ = String(c.type == null ? "" : c.type);
     const p = typ === "DIALOG" ? ids : null;          // участники личного диалога (для имени собеседника)
+    const t = Number(c.lastEventTime || c.modified || 0) || 0;   // свежесть переписки (для списка контактов)
+    // последнее сообщение — чтобы владелец опознал собеседника без номера («Ольга» и кто это?)
+    const lmText = c.lastMessage && c.lastMessage.text ? String(c.lastMessage.text).replace(/\s+/g, " ").slice(0, 70) : "";
     if (typ === "DIALOG" && n === 2 && !(window.__maxfwd_chats[key] && window.__maxfwd_chats[key].counted)) {
       for (const u of ids) _dlgPeers[u] = (_dlgPeers[u] || 0) + 1;
-      window.__maxfwd_chats[key] = { type: typ, n: n, counted: 1, p: p };
+      window.__maxfwd_chats[key] = { type: typ, n: n, counted: 1, p: p, t: t, lm: lmText };
     } else {
       const prev = window.__maxfwd_chats[key];
-      window.__maxfwd_chats[key] = { type: typ, n: n, counted: prev && prev.counted ? 1 : 0, p: p };
+      window.__maxfwd_chats[key] = { type: typ, n: n, counted: prev && prev.counted ? 1 : 0, p: p,
+                                     t: Math.max(t, (prev && prev.t) || 0), lm: lmText || (prev && prev.lm) || "" };
     }
     if (c.lastMessage) noteMsg(c.lastMessage, c.id);
     window.__maxfwd_me = myId();
