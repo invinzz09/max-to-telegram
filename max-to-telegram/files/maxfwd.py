@@ -1077,36 +1077,22 @@ def media_worker(kind, name, chat_id, sender_id=None):
         try:
             set_edge_windows(SW_SHOWNOACTIVATE)  # показать окно без фокуса — чтобы лента рендерилась
             time.sleep(1.8)
-            # открыть чат ОТПРАВИТЕЛЯ по префиксу имени (полное имя в списке усечено);
-            # если имени нет — верхний чат (последняя надежда).
-            pref = (sender or "")[:18]
+            # Открыть ИМЕННО чат этого сообщения: только со сверкой адреса /<chatId>.
+            # ⛔ Никаких запасных «открыть верхний чат» / «по префиксу имени»: 08.10 так открылся
+            # ЧУЖОЙ чат, и видео могло прийти из другой переписки. Не открылся нужный — пометка.
             res = None
             if chat_id not in (None, "") and _cur_path(c) == f"/{chat_id}":
                 res = "already"                       # нужный чат уже открыт
             elif chat_id not in (None, "") and max_open_chat(
-                    c, chat_id, [n for n in (maxname, name_by_chat(chat_id), sender) if n]):
+                    c, chat_id, [n for n in (grp, maxname, name_by_chat(chat_id), sender) if n]):
                 res = "verified"                      # открыт и сверен по адресу /<chatId>
-            elif pref:
-                _cdp_eval(c, _JS_LIST_TOP); time.sleep(0.8)
-                res = _cdp_eval(c, _JS_OPEN_CHAT % json.dumps(pref))
-                if res == "NOCHAT":
-                    _cdp_eval(c, _JS_LIST_TOP); time.sleep(1.0)
-                    res = _cdp_eval(c, _JS_OPEN_CHAT % json.dumps(pref))
-            else:
-                _cdp_eval(c, _JS_LIST_TOP); time.sleep(0.8)
-                res = _cdp_eval(c, _JS_OPEN_TOP)
+            if res is None:
+                log(f"медиа: чат {chat_id} не открыт со сверкой — пометка, чужие чаты не трогаю")
+                tg_send(cfg, _cap_caption(f"💬 {display or sender or 'MAX'}")
+                        + f"\n📎 {kind.lower()}: {name} (не удалось открыть чат в MAX)")
+                return
             time.sleep(3.2)
             title = (_cdp_eval(c, _JS_CHAT_TITLE) or "").strip()
-            # Защита: не пересылать из ЧУЖОГО чата. Если открыт не тот — пометка.
-            if res not in ("already", "verified") and sender and title \
-                    and sender[:10] not in title and title[:10] not in sender:
-                log(f"медиа: открыт не тот чат (нужен {sender!r}, открыт {title!r}) — пометка")
-                tg_send(cfg, _cap_caption(f"💬 {sender}") + f"\n📎 {kind.lower()}: {name} (чат не найден)")
-                return
-            if res in (None, "NOCHAT", "NOROWS"):
-                log(f"медиа: чат не открыт (res={res}, имя={sender!r}) — пометка")
-                tg_send(cfg, _cap_caption(f"💬 {sender or 'MAX'}") + f"\n📎 {kind.lower()}: {name} (чат не найден)")
-                return
             title = display or title or sender or "MAX"
             cap = _cap_caption(f"💬 {title}")
             _cdp_eval(c, _JS_MSG_BOTTOM)
@@ -1999,7 +1985,7 @@ def tg_react(cfg, mid, emoji):
 
 def reply_worker(cfg, owner_mid, chat_id, names, body, tgfile=None, th=None):
     _tl.thread = th                    # подтверждения — в ту же тему, где писал владелец
-    tg_react(cfg, owner_mid, "✍")      # «отправляется…» — пометка на сообщении владельца
+    # (реакцию «✍ отправляется» убрали 09.10: каждая реакция бота = «непрочитанная реакция» с сердечком)
     path = None
     if tgfile:
         path = tg_download(cfg, tgfile, owner_mid)
