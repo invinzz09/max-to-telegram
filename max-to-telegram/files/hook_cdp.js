@@ -270,7 +270,9 @@
     } else {
       const prev = window.__maxfwd_chats[key];
       window.__maxfwd_chats[key] = { type: typ, n: n, counted: prev && prev.counted ? 1 : 0, p: p,
-                                     t: Math.max(t, (prev && prev.t) || 0), lm: lmText || (prev && prev.lm) || "" };
+                                     t: Math.max(t, (prev && prev.t) || 0), lm: lmText || (prev && prev.lm) || "",
+                                     // название группы/канала (у личных диалогов его нет)
+                                     title: c.title ? String(c.title) : ((prev && prev.title) || "") };
     }
     if (c.lastMessage) noteMsg(c.lastMessage, c.id);
     window.__maxfwd_me = myId();

@@ -131,6 +131,19 @@ def tg_name_by_phone(phone):
     return _tgnames["map"].get(digits) or None
 
 
+def chat_meta(chat_id):
+    """{type: DIALOG/CHAT/CHANNEL, title: название группы} из кадров MAX (или {})."""
+    c = _cdp[0]
+    if not c or chat_id in (None, ""):
+        return {}
+    try:
+        v = _cdp_eval(c, "JSON.stringify((()=>{const ch=(window.__maxfwd_chats||{})[%s]||{};"
+                         "return {type:ch.type||'', title:ch.title||''};})())" % json.dumps(str(chat_id)), timeout=10)
+        return json.loads(v or "{}")
+    except Exception:
+        return {}
+
+
 def user_name(user_id):
     """Имя любого пользователя MAX по userId (автор пересланного): подпись из Telegram владельца
     по номеру, иначе из MAX. None — не нашли."""
@@ -329,7 +342,24 @@ def topic_for(cfg, chat_id, name):
     with _topics_lock:
         m = _topics_load()
         if cid in m["by_chat"]:
-            return m["by_chat"][cid]
+            th = m["by_chat"][cid]
+            old = (m["by_thread"].get(str(th)) or {}).get("n", "")
+            nm = (name or "").strip()
+            # тема создалась безымянной («MAX») — переименовать, когда имя стало известно
+            if old in ("", "MAX") and nm and nm != "MAX":
+                try:
+                    r = tg_api(cfg, "editForumTopic", {"chat_id": cfg["chat_id"], "message_thread_id": th,
+                                                       "name": nm[:128]})
+                    if r and r.get("ok"):
+                        m["by_thread"][str(th)] = {"c": cid, "n": nm}
+                        tmp = TOPICS + ".tmp"
+                        with open(tmp, "w", encoding="utf-8") as f:
+                            json.dump(m, f, ensure_ascii=False, indent=1)
+                        os.replace(tmp, TOPICS)
+                        log(f"темы: тема {th} переименована")
+                except Exception as e:
+                    log(f"темы: не переименовал {e!r}")
+            return th
         r = None
         try:
             r = tg_api(cfg, "createForumTopic", {"chat_id": cfg["chat_id"],
@@ -506,7 +536,14 @@ def drain_pending():
                 keep.append(item)
         _pending[:] = keep
     for rel, text, att, sender, chat_id, extra in ready:
-        name = contact_for(chat_id, sender) or name_for(text, chat_id) or "MAX"
+        meta = chat_meta(chat_id)
+        if meta.get("type") in ("CHAT", "CHANNEL") and meta.get("title"):
+            # группа: вкладка/«кому» — название группы, в шапке — кто написал
+            who = meta["title"]
+            name = user_name(sender) or "участник"
+        else:
+            name = contact_for(chat_id, sender) or name_for(text, chat_id) or "MAX"
+            who = name
         if extra.get("fwd"):
             src = user_name(extra.get("fwd_from")) if extra.get("fwd_from") not in (None, sender) else None
             head = "↪️ Переслано" + (f" от {src}" if src else "")
@@ -521,15 +558,15 @@ def drain_pending():
         # Текстовое сообщение: если есть текст, прочие вложения, или нет ни фото, ни голосовых.
         if has_text or other or not (photos or voices):
             acts.append({"kind": "text", "text": format_full(name, {"text": text, "att": other}),
-                         "who": name, "chat": chat_id})
+                         "who": who, "chat": chat_id})
         # Каждое фото — отдельной картинкой с короткой подписью (имя отправителя).
         for a in photos:
             acts.append({"kind": "photo", "url": a[2], "name": a[1] or "",
-                         "caption": _cap_caption(f"💬 {name}"), "who": name, "chat": chat_id})
+                         "caption": _cap_caption(f"💬 {name}"), "who": who, "chat": chat_id})
         # Голосовое — настоящим голосовым Telegram, следом расшифровка (локальный Whisper).
         for a in voices:
             acts.append({"kind": "voice", "url": a[2], "caption": _cap_caption(f"💬 {name}"),
-                         "who": name, "chat": chat_id})
+                         "who": who, "chat": chat_id})
         with _out_lock:
             _out_q.extend(acts)
         log(f"CDP: в очередь (имя={'да' if name != 'MAX' else 'нет'}, "
@@ -1030,7 +1067,12 @@ def media_worker(kind, name, chat_id, sender_id=None):
         if not c or not cfg:
             log(f"медиа: нет CDP/cfg — {kind} '{name}' пропущен")
             return
-        _tl.thread = topic_for(cfg, chat_id, display or sender)   # видео/файл — в тему этой переписки
+        meta = chat_meta(chat_id)
+        grp = meta.get("title") if meta.get("type") in ("CHAT", "CHANNEL") else None
+        # видео/файл — в тему этой переписки (у группы тема = название группы, в подписи — кто прислал)
+        _tl.thread = topic_for(cfg, chat_id, grp or display or sender)
+        if grp:
+            display = user_name(sender_id) or display
         _media_busy[0] = True
         try:
             set_edge_windows(SW_SHOWNOACTIVATE)  # показать окно без фокуса — чтобы лента рендерилась
@@ -1397,7 +1439,12 @@ def _tok_ok(tok, hay):
     if tok in hay:
         return True
     root = NICK.get(tok)
-    return bool(root) and root in hay
+    if root and root in hay:                       # «настя» -> в подписи «Анастасия»
+        return True
+    # и наоборот: «дарья» -> в подписи «Даша» (полное имя запроса -> уменьшительные)
+    hw = hay.split()
+    return any(tok.startswith(r) and len(r) >= 3 and any(w.startswith(nick) for w in hw)
+               for nick, r in NICK.items())
 
 
 def find_people(query):
@@ -1694,8 +1741,15 @@ def _check_dialog_and_open(c, chat_id, names):
             break
         time.sleep(1)
     typ = str((info or {}).get("type") or "")
+    if typ == "CHAT":                              # группа (с 09.10 владелец разрешил писать в группы)
+        title = str((info or {}).get("title") or "").strip()
+        if title:
+            names = [title] + [n for n in names if n != title]
+        if not max_open_chat(c, chat_id, names):
+            return "не нашёл эту группу в списке MAX"
+        return None
     if typ != "DIALOG":
-        return ("это групповой чат/канал — туда не отправляю" if typ
+        return ("это канал — туда не отправляю" if typ
                 else "не знаю тип чата (личный или группа) — не отправляю")
     # имя собеседника из контактов MAX — первым кандидатом для поиска строки в списке
     # (шапка пересылки может быть «Входящий вызов»); адресат всё равно сверяется по chatId
