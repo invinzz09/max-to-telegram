@@ -319,6 +319,7 @@ def _tg_msgid(stdout):
 # Текущая тема задаётся на поток работы (_tl.thread), tg_send/_tg_multipart берут её сами.
 _tl = threading.local()
 _topics_ok = [False]          # getMe.has_topics_enabled
+_bot_username = ['']          # getMe.username — для ссылок на темы
 TOPICS = os.path.join(BASE, "topics.json")   # {"by_chat": {chatId: thread}, "by_thread": {thread: {c, n}}}
 _topics_lock = threading.Lock()
 
@@ -1643,6 +1644,11 @@ def on_callback(cfg, cq):
     if th:                                        # темы включены — карточка в теме человека, писать прямо там
         _tl.thread = th
         mid = tg_send(cfg, f"💬 {disp}{hint}\nПиши здесь, в этой теме — текст или файл.")
+        # туда, где нажали, — кнопка-ссылка на карточку в теме (бот сам переключить вкладку не может)
+        _tl.thread = cmsg.get("message_thread_id") if cmsg.get("is_topic_message") else None
+        if mid and _bot_username[0]:
+            tg_send(cfg, f"Вкладка «{disp}» готова.", markup={"inline_keyboard": [[
+                {"text": f"Открыть «{disp[:30]}» ›", "url": f"https://t.me/{_bot_username[0]}/{th}/{mid}"}]]})
         _tl.thread = None
         try:
             tg_api(cfg, "answerCallbackQuery", {"callback_query_id": cq.get("id", ""),
@@ -2034,16 +2040,12 @@ def reply_worker(cfg, owner_mid, chat_id, names, body, tgfile=None, th=None):
             with _echo_lock:
                 _sent_log.append((time.time(), str(chat_id), _flat(body), owner_mid))
                 del _sent_log[:-300]
-        # успех — пометка на самом сообщении владельца (✍ → 👌); если реакция не встала — прежнее сообщение
+        # успех — тишина (решение владельца 15.10: реакции бота дают «сердечки» непрочитанных реакций и путают);
+        # сообщение владельца запоминаем, чтобы на него тоже можно было ответить
         remember(owner_mid, info or (names[0] if names else ""), chat_id)
-        if not tg_react(cfg, owner_mid, "👌"):
-            mid = tg_send(cfg, f"✅ Отправлено в MAX → {info}{what}", reply_to=owner_mid)
-            remember(mid, info or (names[0] if names else ""), chat_id)
     elif sent_file:
-        tg_react(cfg, owner_mid, None)
         tg_send(cfg, f"⚠️ {info}", reply_to=owner_mid)
     else:
-        tg_react(cfg, owner_mid, None)
         tg_send(cfg, f"❌ Не отправлено{what}: {info}", reply_to=owner_mid)
 
 
@@ -2217,6 +2219,7 @@ def reply_loop():
                 r = tg_api(cfg, "getMe", {})
                 _inline_ok[0] = bool(r and r.get("ok") and r["result"].get("supports_inline_queries"))
                 _topics_ok[0] = bool(r and r.get("ok") and r["result"].get("has_topics_enabled"))
+                _bot_username[0] = (r["result"].get("username") or "") if r and r.get("ok") else _bot_username[0]
                 _inline_ok_ts[0] = time.time()
             except Exception:
                 pass
